@@ -13,6 +13,7 @@ function(llama_cpp_python_install_target target)
         ARCHIVE DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/llama_cpp/lib
         FRAMEWORK DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/llama_cpp/lib
         RESOURCE DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/llama_cpp/lib
+        PUBLIC_HEADER DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/llama_cpp/include
     )
     install(
         TARGETS ${target}
@@ -21,6 +22,7 @@ function(llama_cpp_python_install_target target)
         ARCHIVE DESTINATION ${SKBUILD_PLATLIB_DIR}/llama_cpp/lib
         FRAMEWORK DESTINATION ${SKBUILD_PLATLIB_DIR}/llama_cpp/lib
         RESOURCE DESTINATION ${SKBUILD_PLATLIB_DIR}/llama_cpp/lib
+        PUBLIC_HEADER DESTINATION ${SKBUILD_PLATLIB_DIR}/llama_cpp/include
     )
     set_target_properties(${target} PROPERTIES
         INSTALL_RPATH "$ORIGIN"
@@ -88,9 +90,7 @@ if (LLAMA_BUILD)
         add_custom_command(TARGET llama POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_RUNTIME_DLLS:llama>
-            ${CMAKE_CURRENT_SOURCE_DIR}/llama_cpp/lib)
-        
-        add_custom_command(TARGET llama POST_BUILD
+            ${CMAKE_CURRENT_SOURCE_DIR}/llama_cpp/lib
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_RUNTIME_DLLS:llama>
             ${SKBUILD_PLATLIB_DIR}/llama_cpp/lib)
