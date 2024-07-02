@@ -13,7 +13,6 @@ function(llama_cpp_python_install_target target)
         ARCHIVE DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/llama_cpp/lib
         FRAMEWORK DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/llama_cpp/lib
         RESOURCE DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/llama_cpp/lib
-        PUBLIC_HEADER DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/llama_cpp/include
     )
     install(
         TARGETS ${target}
@@ -22,7 +21,6 @@ function(llama_cpp_python_install_target target)
         ARCHIVE DESTINATION ${SKBUILD_PLATLIB_DIR}/llama_cpp/lib
         FRAMEWORK DESTINATION ${SKBUILD_PLATLIB_DIR}/llama_cpp/lib
         RESOURCE DESTINATION ${SKBUILD_PLATLIB_DIR}/llama_cpp/lib
-        PUBLIC_HEADER DESTINATION ${SKBUILD_PLATLIB_DIR}/llama_cpp/include
     )
     set_target_properties(${target} PROPERTIES
         INSTALL_RPATH "$ORIGIN"
