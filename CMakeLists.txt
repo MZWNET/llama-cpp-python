@@ -72,6 +72,7 @@ if (LLAMA_BUILD)
     add_subdirectory(vendor/llama.cpp)
     llama_cpp_python_install_target(llama)
     llama_cpp_python_install_target(ggml)
+    
     # Workaround for Windows + CUDA https://github.com/abetlen/llama-cpp-python/issues/563
     if (WIN32)
         install(
@@ -82,6 +83,17 @@ if (LLAMA_BUILD)
             FILES $<TARGET_RUNTIME_DLLS:llama>
             DESTINATION ${SKBUILD_PLATLIB_DIR}/llama_cpp/lib
         )
+
+        # Ensure dependent DLLs are also copied
+        add_custom_command(TARGET llama POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_RUNTIME_DLLS:llama>
+            ${CMAKE_CURRENT_SOURCE_DIR}/llama_cpp/lib)
+        
+        add_custom_command(TARGET llama POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_RUNTIME_DLLS:llama>
+            ${SKBUILD_PLATLIB_DIR}/llama_cpp/lib)
     endif()
 
     if (LLAVA_BUILD)
