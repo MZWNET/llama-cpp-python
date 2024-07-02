@@ -6,8 +6,12 @@ import uuid
 import time
 import json
 import ctypes
+import typing
 import fnmatch
+import warnings
+import contextlib
 import multiprocessing
+from types import TracebackType
 
 from typing import (
     List,
@@ -18,6 +22,8 @@ from typing import (
     Iterator,
     Deque,
     Callable,
+    Dict,
+    Type,
 )
 from collections import deque
 from pathlib import Path
@@ -49,6 +55,7 @@ from ._internals import (
     _LlamaTokenDataArray,  # type: ignore
     _LlamaSamplingParams,  # type: ignore
     _LlamaSamplingContext,  # type: ignore
+    _normalize_embedding,  # type: ignore
 )
 from ._logger import set_verbose
 from ._utils import suppress_stdout_stderr
@@ -68,10 +75,11 @@ class Llama:
         split_mode: int = llama_cpp.LLAMA_SPLIT_MODE_LAYER,
         main_gpu: int = 0,
         tensor_split: Optional[List[float]] = None,
+        rpc_servers: Optional[str] = None,
         vocab_only: bool = False,
         use_mmap: bool = True,
         use_mlock: bool = False,
-        kv_overrides: Optional[Dict[str, Union[bool, int, float]]] = None,
+        kv_overrides: Optional[Dict[str, Union[bool, int, float, str]]] = None,
         # Context Params
         seed: int = llama_cpp.LLAMA_DEFAULT_SEED,
         n_ctx: int = 512,
@@ -90,6 +98,7 @@ class Llama:
         logits_all: bool = False,
         embedding: bool = False,
         offload_kqv: bool = True,
+        flash_attn: bool = False,
         # Sampling Params
         last_n_tokens_size: int = 64,
         # LoRA Params
@@ -109,6 +118,7 @@ class Llama:
         type_k: Optional[int] = None,
         type_v: Optional[int] = None,
         # Misc
+        spm_infill: bool = False,
         verbose: bool = True,
         # Extra Params
         **kwargs,  # type: ignore
@@ -145,6 +155,7 @@ class Llama:
             split_mode: How to split the model across GPUs. See llama_cpp.LLAMA_SPLIT_* for options.
             main_gpu: main_gpu interpretation depends on split_mode: LLAMA_SPLIT_NONE: the GPU that is used for the entire model. LLAMA_SPLIT_ROW: the GPU that is used for small tensors and intermediate results. LLAMA_SPLIT_LAYER: ignored
             tensor_split: How split tensors should be distributed across GPUs. If None, the model is not split.
+            rpc_servers: Comma separated list of RPC servers to use for offloading
             vocab_only: Only load the vocabulary no weights.
             use_mmap: Use mmap if possible.
             use_mlock: Force the system to keep the model in RAM.
@@ -166,6 +177,7 @@ class Llama:
             logits_all: Return logits for all tokens, not just the last token. Must be True for completion to return logprobs.
             embedding: Embedding mode only.
             offload_kqv: Offload K, Q, V to GPU.
+            flash_attn: Use flash attention.
             last_n_tokens_size: Maximum number of tokens to keep in the last_n_tokens deque.
             lora_base: Optional path to base model, useful if using a quantized base model and you want to apply LoRA to an f16 model.
             lora_path: Path to a LoRA file to apply to the model.
@@ -177,6 +189,7 @@ class Llama:
             verbose: Print verbose output to stderr.
             type_k: KV cache data type for K (default: f16)
             type_v: KV cache data type for V (default: f16)
+            spm_infill: Use Suffix/Prefix/Middle pattern for infill (instead of Prefix/Suffix/Middle) as some models prefer this.
 
         Raises:
             ValueError: If the model path does not exist.
@@ -215,6 +228,11 @@ class Llama:
         )  # 0x7FFFFFFF is INT32 max, will be auto set to all layers
         self.model_params.split_mode = split_mode
         self.model_params.main_gpu = main_gpu
+        if rpc_servers is not None:
+            self.model_params.rpc_servers = rpc_servers.encode('utf-8')
+            self._rpc_servers = rpc_servers
+        else:
+            self._rpc_servers = None
         self.tensor_split = tensor_split
         self._c_tensor_split = None
         if self.tensor_split is not None:
@@ -245,13 +263,27 @@ class Llama:
                 self._kv_overrides_array[i].key = k.encode("utf-8")
                 if isinstance(v, bool):
                     self._kv_overrides_array[i].tag = llama_cpp.LLAMA_KV_OVERRIDE_TYPE_BOOL
-                    self._kv_overrides_array[i].value.bool_value = v
+                    self._kv_overrides_array[i].value.val_bool = v
                 elif isinstance(v, int):
                     self._kv_overrides_array[i].tag = llama_cpp.LLAMA_KV_OVERRIDE_TYPE_INT
-                    self._kv_overrides_array[i].value.int_value = v
+                    self._kv_overrides_array[i].value.val_i64 = v
                 elif isinstance(v, float):
                     self._kv_overrides_array[i].tag = llama_cpp.LLAMA_KV_OVERRIDE_TYPE_FLOAT
-                    self._kv_overrides_array[i].value.float_value = v
+                    self._kv_overrides_array[i].value.val_f64 = v
+                elif isinstance(v, str): # type: ignore
+                    v_bytes = v.encode("utf-8")
+                    if len(v_bytes) > 128: # TODO: Make this a constant
+                        raise ValueError(f"Value for {k} is too long: {v}")
+                    v_bytes = v_bytes.ljust(128, b"\0")
+                    self._kv_overrides_array[i].tag = llama_cpp.LLAMA_KV_OVERRIDE_TYPE_STR
+                    # copy min(v_bytes, 128) to str_value
+                    address = typing.cast(int, ctypes.addressof(self._kv_overrides_array[i].value) + llama_cpp.llama_model_kv_override_value.val_str.offset)
+                    buffer_start = ctypes.cast(address, ctypes.POINTER(ctypes.c_char))
+                    ctypes.memmove(
+                        buffer_start,
+                        v_bytes,
+                        128,
+                    )
                 else:
                     raise ValueError(f"Unknown value type for {k}: {v}")
 
@@ -262,9 +294,7 @@ class Llama:
 
         self.n_batch = min(n_ctx, n_batch)  # ???
         self.n_threads = n_threads or max(multiprocessing.cpu_count() // 2, 1)
-        self.n_threads_batch = n_threads_batch or max(
-            multiprocessing.cpu_count() // 2, 1
-        )
+        self.n_threads_batch = n_threads_batch or multiprocessing.cpu_count()
 
         # Context Params
         self.context_params = llama_cpp.llama_context_default_params()
@@ -303,6 +333,7 @@ class Llama:
         )  # Must be set to True for speculative decoding
         self.context_params.embeddings = embedding # TODO: Rename to embeddings
         self.context_params.offload_kqv = offload_kqv
+        self.context_params.flash_attn = flash_attn
         #  KV cache quantization
         if type_k is not None:
             self.context_params.type_k = type_k
@@ -317,12 +348,16 @@ class Llama:
         self.lora_scale = lora_scale
         self.lora_path = lora_path
 
+        self.spm_infill = spm_infill
+
         if not os.path.exists(model_path):
             raise ValueError(f"Model path does not exist: {model_path}")
 
-        self._model = _LlamaModel(
+        self._stack = contextlib.ExitStack()
+
+        self._model = self._stack.enter_context(contextlib.closing(_LlamaModel(
             path_model=self.model_path, params=self.model_params, verbose=self.verbose
-        )
+        )))
 
         # Override tokenizer
         self.tokenizer_ = tokenizer or LlamaTokenizer(self)
@@ -334,18 +369,18 @@ class Llama:
             self.context_params.n_ctx = self._model.n_ctx_train()
             self.context_params.n_batch = self.n_batch
 
-        self._ctx = _LlamaContext(
+        self._ctx = self._stack.enter_context(contextlib.closing(_LlamaContext(
             model=self._model,
             params=self.context_params,
             verbose=self.verbose,
-        )
+        )))
 
-        self._batch = _LlamaBatch(
+        self._batch = self._stack.enter_context(contextlib.closing(_LlamaBatch(
             n_tokens=self.n_batch,
             embd=0,
             n_seq_max=self.context_params.n_ctx,
             verbose=self.verbose,
-        )
+        )))
 
         if self.lora_path:
             if self._model.apply_lora_from_file(
@@ -363,6 +398,7 @@ class Llama:
 
         self.chat_format = chat_format
         self.chat_handler = chat_handler
+        self._chat_handlers: Dict[str, llama_chat_format.LlamaChatCompletionHandler] = {}
 
         self.draft_model = draft_model
 
@@ -394,10 +430,33 @@ class Llama:
         if self.verbose:
             print(f"Model metadata: {self.metadata}", file=sys.stderr)
 
+        eos_token_id = self.token_eos()
+        bos_token_id = self.token_bos()
+
+        eos_token = self._model.token_get_text(eos_token_id) if eos_token_id != -1 else ""
+        bos_token = self._model.token_get_text(bos_token_id) if bos_token_id != -1 else ""
+
+        # Unfortunately the llama.cpp API does not return metadata arrays, so we can't get template names from tokenizer.chat_templates
+        template_choices = dict((name[10:], template) for name, template in self.metadata.items() if name.startswith("tokenizer.chat_template."))
+
+        if "tokenizer.chat_template" in self.metadata:
+            template_choices["chat_template.default"] = self.metadata["tokenizer.chat_template"]
+
+        if self.verbose and template_choices:
+            print(f"Available chat formats from metadata: {', '.join(template_choices.keys())}", file=sys.stderr)
+
+        for name, template in template_choices.items():
+            self._chat_handlers[name] = llama_chat_format.Jinja2ChatFormatter(
+                template=template,
+                eos_token=eos_token,
+                bos_token=bos_token,
+                stop_token_ids=[eos_token_id],
+            ).to_chat_handler()
+
         if (
             self.chat_format is None
             and self.chat_handler is None
-            and "tokenizer.chat_template" in self.metadata
+            and "chat_template.default" in template_choices
         ):
             chat_format = llama_chat_format.guess_chat_format_from_gguf_metadata(
                 self.metadata
@@ -408,32 +467,17 @@ class Llama:
                 if self.verbose:
                     print(f"Guessed chat format: {chat_format}", file=sys.stderr)
             else:
-                template = self.metadata["tokenizer.chat_template"]
-                try:
-                    eos_token_id = int(self.metadata["tokenizer.ggml.eos_token_id"])
-                except:
-                    eos_token_id = self.token_eos()
-                try:
-                    bos_token_id = int(self.metadata["tokenizer.ggml.bos_token_id"])
-                except:
-                    bos_token_id = self.token_bos()
-
-                eos_token = self._model.token_get_text(eos_token_id)
-                bos_token = self._model.token_get_text(bos_token_id)
-
                 if self.verbose:
-                    print(f"Using gguf chat template: {template}", file=sys.stderr)
+                    print(f"Using gguf chat template: {template_choices['chat_template.default']}", file=sys.stderr)
                     print(f"Using chat eos_token: {eos_token}", file=sys.stderr)
                     print(f"Using chat bos_token: {bos_token}", file=sys.stderr)
 
-                self.chat_handler = llama_chat_format.Jinja2ChatFormatter(
-                    template=template, eos_token=eos_token, bos_token=bos_token
-                ).to_chat_handler()
+                self.chat_format = "chat_template.default"
 
         if self.chat_format is None and self.chat_handler is None:
             self.chat_format = "llama-2"
             if self.verbose:
-                print(f"Using fallback chat format: {chat_format}", file=sys.stderr)
+                print(f"Using fallback chat format: {self.chat_format}", file=sys.stderr)
 
     @property
     def ctx(self) -> llama_cpp.llama_context_p:
@@ -538,12 +582,12 @@ class Llama:
             if self.context_params.logits_all:
                 rows = n_tokens
                 cols = self._n_vocab
-                logits = self._ctx.get_logits()[: rows * cols]
+                logits = np.ctypeslib.as_array(self._ctx.get_logits(), shape=(rows * cols, ))
                 self.scores[n_past : n_past + n_tokens, :].reshape(-1)[: :] = logits
             else:
                 rows = 1
                 cols = self._n_vocab
-                logits = self._ctx.get_logits()[: rows * cols]
+                logits = np.ctypeslib.as_array(self._ctx.get_logits(), shape=(rows * cols, ))
                 self.scores[n_past + n_tokens - 1, :].reshape(-1)[: :] = logits
             # Update n_tokens
             self.n_tokens += n_tokens
@@ -758,7 +802,7 @@ class Llama:
         input = input if isinstance(input, list) else [input]
 
         # get numeric embeddings
-        embeds: List[List[float]]
+        embeds: Union[List[List[float]], List[List[List[float]]]]
         total_tokens: int
         embeds, total_tokens = self.embed(input, return_count=True)  # type: ignore
 
@@ -785,7 +829,7 @@ class Llama:
     def embed(
         self,
         input: Union[str, List[str]],
-        normalize: bool = True,
+        normalize: bool = False,
         truncate: bool = True,
         return_count: bool = False,
     ):
@@ -800,6 +844,10 @@ class Llama:
         assert self._ctx.ctx is not None
         n_embd = self.n_embd()
         n_batch = self.n_batch
+
+        # get pooling information
+        pooling_type = self.pooling_type()
+        logits_all = pooling_type == llama_cpp.LLAMA_POOLING_TYPE_NONE
 
         if self.context_params.embeddings == False:
             raise RuntimeError(
@@ -818,29 +866,37 @@ class Llama:
         self._batch.reset()
 
         # decode and fetch embeddings
-        data: List[List[float]] = []
+        data: Union[List[List[float]], List[List[List[float]]]] = []
 
-        def decode_batch(n_seq: int):
+        def decode_batch(seq_sizes: List[int]):
             assert self._ctx.ctx is not None
             llama_cpp.llama_kv_cache_clear(self._ctx.ctx)
             self._ctx.decode(self._batch)
             self._batch.reset()
 
             # store embeddings
-            for i in range(n_seq):
-                ptr = llama_cpp.llama_get_embeddings_seq(
-                    self._ctx.ctx, i
-                )
-                if not ptr:
-                    raise RuntimeError("Failed to get embeddings from sequence pooling type is not set")
-                embedding: List[float] = ptr[:n_embd]
-                if normalize:
-                    norm = float(np.linalg.norm(embedding))
-                    embedding = [v / norm for v in embedding]
-                data.append(embedding)
+            if pooling_type == llama_cpp.LLAMA_POOLING_TYPE_NONE:
+                pos: int = 0
+                for i, size in enumerate(seq_sizes):
+                    ptr = llama_cpp.llama_get_embeddings(self._ctx.ctx)
+                    embedding: List[List[float]] = [
+                        ptr[pos + j * n_embd : pos + (j + 1) * n_embd] for j in range(size)
+                    ]
+                    if normalize:
+                        embedding = [_normalize_embedding(e) for e in embedding]
+                    data.append(embedding)
+                    pos += size
+            else:
+                for i in range(len(seq_sizes)):
+                    ptr = llama_cpp.llama_get_embeddings_seq(self._ctx.ctx, i)
+                    embedding: List[float] = ptr[:n_embd]
+                    if normalize:
+                        embedding = _normalize_embedding(embedding)
+                    data.append(embedding)
 
         # init state
         total_tokens = 0
+        s_batch = []
         t_batch = 0
         p_batch = 0
 
@@ -861,17 +917,21 @@ class Llama:
 
             # time to eval batch
             if t_batch + n_tokens > n_batch:
-                decode_batch(p_batch)
+                decode_batch(s_batch)
+                s_batch = []
                 t_batch = 0
                 p_batch = 0
 
             # add to batch
-            self._batch.add_sequence(tokens, p_batch, False)
+            self._batch.add_sequence(tokens, p_batch, logits_all)
+
+            # update batch stats
+            s_batch.append(n_tokens)
             t_batch += n_tokens
             p_batch += 1
 
         # hanlde last batch
-        decode_batch(p_batch)
+        decode_batch(s_batch)
 
         if self.verbose:
             llama_cpp.llama_print_timings(self._ctx.ctx)
@@ -921,25 +981,80 @@ class Llama:
 
         completion_id: str = f"cmpl-{str(uuid.uuid4())}"
         created: int = int(time.time())
+        bos_token_id: int = self.token_bos()
+        cls_token_id: int = self._model.token_cls()
+        sep_token_id: int = self._model.token_sep()
+        prefix_token_id: int = self._model.token_prefix()
+        middle_token_id: int = self._model.token_middle()
+        suffix_token_id: int = self._model.token_suffix()
+        add_space_prefix: bool = self.metadata.get("tokenizer.ggml.add_space_prefix", "true") == "true"
+        bos_tokens: List[int] = [cls_token_id if cls_token_id != -1 else bos_token_id]
+        eos_tokens: List[int] = [sep_token_id if sep_token_id != -1 else self.token_eos()]
+
+        if (isinstance(prompt, list) and suffix is None) or self._model.add_bos_token() == 0 or bos_tokens[:1] == [-1]:
+            bos_tokens = []
+
+        if (isinstance(prompt, list) and suffix is None) or (self._model.add_eos_token() != 1 and sep_token_id == -1):
+            eos_tokens = []
+
+        suffix_space_prefix: int = 0
+        # Tokenizer hack to remove leading space
+        if add_space_prefix and suffix_token_id >= 0 and suffix:
+            suffix = "☺" + suffix
+            suffix_space_prefix = 2
+
         # If prompt is empty, initialize completion with BOS token to avoid
         # detokenization including a space at the beginning of the completion
-        completion_tokens: List[int] = [] if len(prompt) > 0 else [self.token_bos()]
+        completion_tokens: List[int] = [] if len(prompt) > 0 else [bos_token_id]
         # Add blank space to start of prompt to match OG llama tokenizer
-        prompt_tokens: List[int] = (
+        prefix_tokens: List[int] = (
             (
-                self.tokenize(prompt.encode("utf-8"), special=True)
-                if prompt != ""
-                else [self.token_bos()]
+                [prefix_token_id]
+                if prefix_token_id >= 0 and suffix is not None
+                else []
             )
-            if isinstance(prompt, str)
-            else prompt
+            +
+            (
+                (
+                    self.tokenize(prompt.encode("utf-8"), add_bos=False, special=(prefix_token_id < 0 or suffix is None))
+                    if prompt != ""
+                    else []
+                )
+                if isinstance(prompt, str)
+                else prompt
+            )
         )
+        suffix_tokens: List[int] = (
+            (
+                [suffix_token_id]
+                +
+                (
+                    self.tokenize(suffix.encode("utf-8"), add_bos=False, special=False)[suffix_space_prefix:]
+                    if suffix
+                    else []
+                )
+            )
+            if suffix_token_id >= 0 and suffix is not None
+            else []
+        )
+        middle_tokens: List[int] = (
+            [middle_token_id]
+            if middle_token_id >= 0 and suffix is not None
+            else []
+        )
+        prompt_tokens: List[int] = bos_tokens + ((suffix_tokens + prefix_tokens + middle_tokens) if self.spm_infill else (prefix_tokens + suffix_tokens + middle_tokens)) + eos_tokens
         text: bytes = b""
         returned_tokens: int = 0
         stop = (
             stop if isinstance(stop, list) else [stop] if isinstance(stop, str) else []
         )
         model_name: str = model if model is not None else self.model_path
+
+        if prompt_tokens[:2] == [self.token_bos()] * 2:
+            warnings.warn(
+                f'Detected duplicate leading "{self._model.token_get_text(self.token_bos())}" in prompt, this will likely reduce response quality, consider removing it...',
+                RuntimeWarning,
+            )
 
         # NOTE: This likely doesn't work correctly for the first token in the prompt
         # because of the extra space added to the start of the prompt_tokens
@@ -1032,7 +1147,8 @@ class Llama:
             logits_processor=logits_processor,
             grammar=grammar,
         ):
-            if token == self._token_eos:
+            assert self._model.model is not None
+            if llama_cpp.llama_token_is_eog(self._model.model, token):
                 text = self.detokenize(completion_tokens, prev_tokens=prompt_tokens)
                 finish_reason = "stop"
                 break
@@ -1083,7 +1199,7 @@ class Llama:
                     # not sure how to handle this branch when dealing
                     # with CJK output, so keep it unchanged
                     for token in remaining_tokens:
-                        if token == self.token_bos():
+                        if token == bos_token_id:
                             continue
                         token_end_position += len(self.detokenize([token], prev_tokens=prompt_tokens + completion_tokens[:returned_tokens]))
                         # Check if stop sequence is in the token
@@ -1210,7 +1326,7 @@ class Llama:
 
                 logprobs_or_none: Optional[CompletionLogprobs] = None
                 if logprobs is not None:
-                    if token == self.token_bos():
+                    if token == bos_token_id:
                         continue
                     token_str = self.detokenize([token]).decode(
                         "utf-8", errors="ignore"
@@ -1311,7 +1427,7 @@ class Llama:
         if echo:
             text_str = prompt + text_str
 
-        if suffix is not None:
+        if suffix_token_id < 0 and suffix is not None:
             text_str = text_str + suffix
 
         logprobs_or_none: Optional[CompletionLogprobs] = None
@@ -1324,8 +1440,8 @@ class Llama:
             top_logprobs: List[Optional[Dict[str, float]]] = []
 
             if echo:
-                # Remove leading BOS token
-                all_tokens = prompt_tokens[1:] + completion_tokens
+                # Remove leading BOS token if exists
+                all_tokens = prompt_tokens[1 if prompt_tokens[0] == self.token_bos() else 0:] + completion_tokens
             else:
                 all_tokens = completion_tokens
 
@@ -1338,7 +1454,7 @@ class Llama:
             for idx, (token, token_str, logprobs_token) in enumerate(
                 zip(all_tokens, all_token_strs, all_logprobs)
             ):
-                if token == self.token_bos():
+                if token == bos_token_id:
                     continue
                 text_offsets.append(
                     text_offset
@@ -1649,7 +1765,7 @@ class Llama:
         Returns:
             Generated chat completion or a stream of chat completion chunks.
         """
-        handler = self.chat_handler or llama_chat_format.get_chat_completion_handler(
+        handler = self.chat_handler or self._chat_handlers.get(self.chat_format) or llama_chat_format.get_chat_completion_handler(
             self.chat_format
         )
         return handler(
@@ -1664,7 +1780,8 @@ class Llama:
             top_k=top_k,
             min_p=min_p,
             typical_p=typical_p,
-            logprobs=top_logprobs if logprobs else None,
+            logprobs=logprobs,
+            top_logprobs=top_logprobs,
             stream=stream,
             stop=stop,
             seed=seed,
@@ -1746,6 +1863,7 @@ class Llama:
             logits_all=self.context_params.logits_all,
             embedding=self.context_params.embeddings,
             offload_kqv=self.context_params.offload_kqv,
+            flash_attn=self.context_params.flash_attn,
             # Sampling Params
             last_n_tokens_size=self.last_n_tokens_size,
             # LoRA Params
@@ -1763,6 +1881,7 @@ class Llama:
             type_k=self.context_params.type_k,
             type_v=self.context_params.type_v,
             # Misc
+            spm_infill=self.spm_infill,
             verbose=self.verbose,
         )
 
@@ -1792,7 +1911,7 @@ class Llama:
                 file=sys.stderr,
             )
         return LlamaState(
-            scores=self.scores.copy(),
+            scores=self._scores.copy(),
             input_ids=self.input_ids.copy(),
             n_tokens=self.n_tokens,
             llama_state=bytes(llama_state_compact),
@@ -1801,7 +1920,9 @@ class Llama:
 
     def load_state(self, state: LlamaState) -> None:
         assert self._ctx.ctx is not None
-        self.scores = state.scores.copy()
+        # Only filling in up to `n_tokens` and then zero-ing out the rest
+        self.scores[: state.n_tokens, :] = state.scores.copy()
+        self.scores[state.n_tokens :, :] = 0.0
         self.input_ids = state.input_ids.copy()
         self.n_tokens = state.n_tokens
         state_size = state.llama_state_size
@@ -1838,6 +1959,17 @@ class Llama:
     def token_nl(self) -> int:
         """Return the newline token."""
         return self._model.token_nl()
+
+    def pooling_type(self) -> str:
+        """Return the pooling type."""
+        return self._ctx.pooling_type()
+
+    def close(self) -> None:
+        """Explicitly free the model from memory."""
+        self._stack.close()
+
+    def __del__(self) -> None:
+        self.close()
 
     @staticmethod
     def logits_to_logprobs(
@@ -1952,7 +2084,6 @@ class Llama:
                 local_dir_use_symlinks=local_dir_use_symlinks,
                 cache_dir=cache_dir,
                 local_files_only=True,
-
             )
         else:
             model_path = os.path.join(local_dir, filename)
@@ -2001,3 +2132,19 @@ class StoppingCriteriaList(List[StoppingCriteria]):
         self, input_ids: npt.NDArray[np.intc], logits: npt.NDArray[np.single]
     ) -> bool:
         return any([stopping_criteria(input_ids, logits) for stopping_criteria in self])
+
+
+class MinTokensLogitsProcessor(LogitsProcessor):
+    def __init__(self, min_tokens: int, token_eos: int):
+        self.min_tokens = min_tokens
+        self.token_eos = token_eos
+        self.prompt_tokens = None
+
+    def __call__(
+        self, input_ids: npt.NDArray[np.intc], scores: npt.NDArray[np.single]
+    ) -> npt.NDArray[np.single]:
+        if self.prompt_tokens is None:
+            self.prompt_tokens = len(input_ids)
+        if len(input_ids) - self.prompt_tokens < self.min_tokens:
+            scores[self.token_eos] = -np.inf
+        return scores
