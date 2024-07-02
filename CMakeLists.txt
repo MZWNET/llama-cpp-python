@@ -13,6 +13,7 @@ function(llama_cpp_python_install_target target)
         ARCHIVE DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/llama_cpp/lib
         FRAMEWORK DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/llama_cpp/lib
         RESOURCE DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/llama_cpp/lib
+        PUBLIC_HEADER DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/llama_cpp/include
     )
     install(
         TARGETS ${target}
@@ -21,6 +22,7 @@ function(llama_cpp_python_install_target target)
         ARCHIVE DESTINATION ${SKBUILD_PLATLIB_DIR}/llama_cpp/lib
         FRAMEWORK DESTINATION ${SKBUILD_PLATLIB_DIR}/llama_cpp/lib
         RESOURCE DESTINATION ${SKBUILD_PLATLIB_DIR}/llama_cpp/lib
+        PUBLIC_HEADER DESTINATION ${SKBUILD_PLATLIB_DIR}/llama_cpp/include
     )
     
     if(UNIX)
@@ -85,8 +87,13 @@ if (LLAMA_BUILD)
     endif()
 
     add_subdirectory(vendor/llama.cpp)
+    
+    # Make sure targets are created before installing
+    add_library(llama ALIAS llama)
+    add_library(ggml ALIAS ggml_static)
+    
     llama_cpp_python_install_target(llama)
-    llama_cpp_python_install_target(ggml)
+    llama_cpp_python_install_target(ggml_static)
     
     if (WIN32)
         # For Windows, we need to make sure all necessary DLLs are installed
@@ -94,10 +101,6 @@ if (LLAMA_BUILD)
         install(
             FILES ${LLAMA_DLLS}
             DESTINATION ${SKBUILD_PLATLIB_DIR}/llama_cpp/lib
-        )
-        install(
-            FILES ${LLAMA_DLLS}
-            DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/llama_cpp/lib
         )
     endif()
 
