@@ -89,11 +89,8 @@ if (LLAMA_BUILD)
     add_subdirectory(vendor/llama.cpp)
     
     # Make sure targets are created before installing
-    add_library(llama ALIAS llama)
-    add_library(ggml ALIAS ggml_static)
-    
     llama_cpp_python_install_target(llama)
-    llama_cpp_python_install_target(ggml_static)
+    llama_cpp_python_install_target(ggml)
     
     if (WIN32)
         # For Windows, we need to make sure all necessary DLLs are installed
