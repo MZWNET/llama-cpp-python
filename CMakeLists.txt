@@ -38,6 +38,14 @@ function(llama_cpp_python_install_target target)
                 BUILD_WITH_INSTALL_RPATH TRUE
             )
         endif()
+    elseif(WIN32)
+        # For Windows, we'll use a custom post-build command to copy dependencies
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_RUNTIME_DLLS:${target}>
+                $<TARGET_FILE_DIR:${target}>
+            COMMAND_EXPAND_LISTS
+        )
     endif()
 endfunction()
 
